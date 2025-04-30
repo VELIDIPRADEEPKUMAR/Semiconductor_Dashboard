@@ -12,7 +12,6 @@ import seaborn as sns
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 from io import BytesIO
-import uuid
 import logging
 
 # Configure logging
@@ -127,20 +126,26 @@ h1, h2, h3 {
 st.markdown(CSS, unsafe_allow_html=True)
 
 # Database initialization
-def init_db():
+def init_db(reset_financials=False, reset_news=False):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    # Drop existing table to ensure correct schema (optional, use with caution)
+    # Drop historical table to ensure correct schema
     c.execute('DROP TABLE IF EXISTS historical')
     c.execute('''CREATE TABLE IF NOT EXISTS historical (
         Date TEXT, Ticker TEXT, Open REAL, High REAL, Low REAL, Close REAL, 
         Volume INTEGER, MA50 REAL, MA200 REAL, PRIMARY KEY(Date,Ticker)
     )''')
+    # Drop financials table if reset is requested
+    if reset_financials:
+        c.execute('DROP TABLE IF EXISTS financials')
     c.execute('''CREATE TABLE IF NOT EXISTS financials (
         Ticker TEXT PRIMARY KEY, Name TEXT, Sector TEXT, PE_Ratio REAL, EPS REAL, 
         Market_Cap REAL, Dividend_Yield REAL, Forward_PE REAL, PEG_Ratio REAL, 
         Debt_To_Equity REAL, Revenue_Growth REAL
     )''')
+    # Drop news table if reset is requested
+    if reset_news:
+        c.execute('DROP TABLE IF EXISTS news')
     c.execute('''CREATE TABLE IF NOT EXISTS news (
         Ticker TEXT, Date TEXT, Headline TEXT, URL TEXT, Sentiment REAL, Summary TEXT,
         PRIMARY KEY(Ticker,Date,Headline)
@@ -149,6 +154,22 @@ def init_db():
         Ticker TEXT, Date TEXT, Post_Count INTEGER, Sentiment REAL,
         PRIMARY KEY(Ticker,Date)
     )''')
+    # Add missing columns to existing tables (for data preservation)
+    c.execute("PRAGMA table_info(financials)")
+    financials_columns = [col[1] for col in c.fetchall()]
+    missing_financials = {
+        'Forward_PE': 'REAL', 'PEG_Ratio': 'REAL', 
+        'Debt_To_Equity': 'REAL', 'Revenue_Growth': 'REAL'
+    }
+    for col, col_type in missing_financials.items():
+        if col not in financials_columns:
+            c.execute(f"ALTER TABLE financials ADD COLUMN {col} {col_type}")
+            logging.info(f"Added column {col} to financials table.")
+    c.execute("PRAGMA table_info(news)")
+    news_columns = [col[1] for col in c.fetchall()]
+    if 'Summary' not in news_columns:
+        c.execute("ALTER TABLE news ADD COLUMN Summary TEXT")
+        logging.info("Added column Summary to news table.")
     conn.commit()
     conn.close()
     logging.info("Database initialized with correct schema.")
@@ -181,6 +202,19 @@ def fetch_historical(tickers, period='5y'):
 # Fetch financials
 def fetch_financials(tickers):
     conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(financials)")
+    columns = [col[1] for col in c.fetchall()]
+    expected_columns = [
+        'Ticker', 'Name', 'Sector', 'PE_Ratio', 'EPS', 'Market_Cap', 'Dividend_Yield',
+        'Forward_PE', 'PEG_Ratio', 'Debt_To_Equity', 'Revenue_Growth'
+    ]
+    if len(columns) != len(expected_columns):
+        st.error(f"Financials table has {len(columns)} columns, expected {len(expected_columns)}. Missing: {[c for c in expected_columns if c not in columns]}. Please reset the database.")
+        logging.error(f"Financials table schema mismatch: {columns}")
+        conn.close()
+        return
+
     for t in tickers:
         with st.spinner(f"Fetching financials for {t}..."):
             try:
@@ -208,6 +242,16 @@ def fetch_financials(tickers):
 # Fetch news and sentiment
 def fetch_news(tickers):
     conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(news)")
+    columns = [col[1] for col in c.fetchall()]
+    expected_columns = ['Ticker', 'Date', 'Headline', 'URL', 'Sentiment', 'Summary']
+    if len(columns) != len(expected_columns):
+        st.error(f"News table has {len(columns)} columns, expected {len(expected_columns)}. Missing: {[c for c in expected_columns if c not in columns]}. Please reset the database.")
+        logging.error(f"News table schema mismatch: {columns}")
+        conn.close()
+        return
+
     for t in tickers:
         with st.spinner(f"Fetching news for {t}..."):
             url = f"{BASE_NEWS_URL}?symbol={t}&from={(datetime.now()-timedelta(days=30)).strftime('%Y-%m-%d')}&to={datetime.now().strftime('%Y-%m-%d')}&token={API_KEY}"
@@ -327,9 +371,23 @@ def top_performers(hist):
 # Main Streamlit app
 def main():
     st.title("Semiconductor Stock Dashboard")
-    init_db()
+    
+    # Database reset options
+    st.sidebar.header("Database Management")
+    col_reset1, col_reset2 = st.sidebar.columns(2)
+    with col_reset1:
+        if st.button("Reset Financials Table"):
+            init_db(reset_financials=True, reset_news=False)
+            st.sidebar.success("Financials table reset successfully. Please fetch data again.")
+    with col_reset2:
+        if st.button("Reset News Table"):
+            init_db(reset_financials=False, reset_news=True)
+            st.sidebar.success("News table reset successfully. Please fetch data again.")
+    
+    # Initialize database
+    init_db(reset_financials=False, reset_news=False)
 
-    # Sidebar
+    # Sidebar controls
     st.sidebar.header("Dashboard Controls")
     period = st.sidebar.selectbox("Historical Data Period:", ['1y', '2y', '5y', '10y'], index=2)
     current_year = datetime.now().year
@@ -502,7 +560,7 @@ def main():
             st.subheader(f"Recent News for {choice}")
             for _, row in news[news['Ticker'] == choice].head(5).iterrows():
                 st.markdown(f"**{row['Date']}**: [{row['Headline']}]({row['URL']}) _(Sentiment: {row['Sentiment']:.2f})_")
-                if row['Summary']:
+                if 'Summary' in row and row['Summary']:
                     with st.expander("Summary"):
                         st.write(row['Summary'])
 
